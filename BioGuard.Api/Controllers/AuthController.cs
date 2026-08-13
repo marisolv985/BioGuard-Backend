@@ -1,0 +1,302 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using System.Security.Claims;
+using BioGuard.Api.DTOs;
+using BioGuard.Api.Services;
+
+namespace BioGuard.Api.Controllers;
+
+/// <summary>
+/// MÓDULO 1: Autenticación y Acceso
+/// ENDPOINT WEB + MÓVIL
+/// </summary>
+[ApiController]
+[Route("api/[controller]")]
+public class AuthController : ControllerBase
+{
+    private readonly AuthService _authService;
+    private readonly AuditoriaService _auditoriaService;
+    private readonly ILogger<AuthController> _logger;
+
+    public AuthController(AuthService authService, AuditoriaService auditoriaService, ILogger<AuthController> logger)
+    {
+        _authService = authService;
+        _auditoriaService = auditoriaService;
+        _logger = logger;
+    }
+
+    // ── Registro ──────────────────────────────────────────────
+    // POST /api/Auth/register [WEB]
+
+    [HttpPost("register")]
+    public async Task<IActionResult> Register([FromBody] RegisterWebRequest request)
+    {
+        _logger.LogInformation("Register attempt for email: {Correo}", request.Correo);
+        var result = await _authService.RegisterWebAsync(request);
+        if (result.Error != null)
+        {
+            _logger.LogWarning("Register failed for email: {Correo}", request.Correo);
+            return BadRequest(new { message = result.Error });
+        }
+        var registerResult = result.Response!;
+        _logger.LogInformation("Register successful for email: {Correo}", request.Correo);
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        await _auditoriaService.RegistrarAsync(registerResult.UserId, "registro", "usuarios_web", registerResult.UserId, ip);
+        if (registerResult.RequiresVerification)
+        {
+            return Ok(new { message = "Código de verificación enviado a tu correo", requiresVerification = true, userId = registerResult.UserId, correo = request.Correo });
+        }
+        return Ok(registerResult);
+    }
+
+    // ── Login ─────────────────────────────────────────────────
+    // POST /api/Auth/login-web [WEB]
+
+    [HttpPost("login-web")]
+    public async Task<IActionResult> LoginWeb([FromBody] LoginWebRequest request)
+    {
+        _logger.LogInformation("Web login attempt for email: {Correo}", request.Correo);
+        var result = await _authService.LoginWebAsync(request);
+        if (result.Error != null)
+        {
+            _logger.LogWarning("Web login failed for email: {Correo} - {Error}", request.Correo, result.Error);
+            var failIp = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            await _auditoriaService.RegistrarAsync("unknown", "login_fallido", "usuarios_web", request.Correo, failIp);
+            return Unauthorized(new { message = result.Error });
+        }
+        var loginResult = result.Response!;
+        if (loginResult.RequiresVerification)
+        {
+            _logger.LogWarning("Web login for unverified user: {Email}", request.Correo);
+            return Ok(new { message = "Tu correo aún no ha sido verificado. Revisa tu bandeja de entrada y confirma el código de verificación.", requiresVerification = true, userId = loginResult.UserId, correo = request.Correo });
+        }
+        _logger.LogInformation("Web login successful for email: {Correo}", request.Correo);
+        var loginIp = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        await _auditoriaService.RegistrarAsync(loginResult.UserId, "login", "usuarios_web", loginResult.UserId, loginIp);
+        if (loginResult.Requires2FA)
+        {
+            return Ok(new { message = "Código 2FA enviado al correo", requires2FA = true, userId = loginResult.UserId });
+        }
+        return Ok(loginResult);
+    }
+
+    // POST /api/Auth/login-google [WEB]
+
+    [HttpPost("login-google")]
+    public async Task<IActionResult> LoginGoogle([FromBody] LoginGoogleRequest request)
+    {
+        _logger.LogInformation("Google login attempt");
+        var result = await _authService.LoginGoogleAsync(request);
+        if (result == null)
+        {
+            _logger.LogWarning("Google login failed - invalid Google token");
+            return Unauthorized(new { message = "Token de Google inválido" });
+        }
+        _logger.LogInformation("Google login successful");
+        return Ok(result);
+    }
+
+    // POST /api/Auth/login-codigo [MÓVIL]
+
+    [HttpPost("login-codigo")]
+    public async Task<IActionResult> LoginByCodigo([FromBody] LoginCodigoRequest request)
+    {
+        _logger.LogInformation("Login by codigo attempt received");
+        var result = await _authService.LoginByCodigoAsync(request);
+        if (result == null)
+        {
+            _logger.LogWarning("Login by codigo failed - code not found");
+            return NotFound(new { message = "Código no encontrado" });
+        }
+        _logger.LogInformation("Login by codigo successful");
+        return Ok(result);
+    }
+
+    // ── 2FA ───────────────────────────────────────────────────
+    // POST /api/Auth/2FA/enviar [WEB]
+
+    [HttpPost("2FA/enviar")]
+    public async Task<IActionResult> Enviar2FA([FromBody] Enviar2FARequest request)
+    {
+        _logger.LogInformation("2FA send attempt for email: {Email}", request.Correo);
+        var result = await _authService.Enviar2FAAsync(request);
+        if (!result)
+        {
+            _logger.LogWarning("2FA send failed for email: {Email} - user not found/inactive or email delivery error", request.Correo);
+            return BadRequest(new { message = "No se pudo enviar el código al correo. Verifica tu dirección o intenta más tarde." });
+        }
+        _logger.LogInformation("2FA code sent to email: {Email}", request.Correo);
+        return Ok(new { message = "Código enviado al correo" });
+    }
+
+    // POST /api/Auth/2FA/verificar [WEB]
+
+    [HttpPost("2FA/verificar")]
+    public async Task<IActionResult> Verificar2FA([FromBody] Verificar2FARequest request)
+    {
+        _logger.LogInformation("2FA verification attempt");
+        var result = await _authService.Verificar2FAAsync(request);
+        if (result == null)
+        {
+            _logger.LogWarning("2FA verification failed - invalid or expired code");
+            return BadRequest(new { message = "Código inválido o expirado" });
+        }
+        _logger.LogInformation("2FA verification successful");
+        return Ok(result);
+    }
+
+    // ── Refresh Token ──────────────────────────────────────
+    // POST /api/Auth/refresh [WEB]
+
+    [HttpPost("refresh")]
+    public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequest request)
+    {
+        _logger.LogInformation("Token refresh attempt");
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
+        var result = await _authService.RefreshTokenAsync(request, ip);
+        if (result == null)
+        {
+            _logger.LogWarning("Token refresh failed - invalid or expired refresh token");
+            return Unauthorized(new { message = "Refresh token inválido o expirado" });
+        }
+        _logger.LogInformation("Token refresh successful");
+        return Ok(result);
+    }
+
+    // ── Recuperación de contraseña ────────────────────────────
+    // POST /api/Auth/forgot-password [WEB]
+
+    [HttpPost("forgot-password")]
+    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest request)
+    {
+        _logger.LogInformation("Forgot password attempt for email: {Correo}", request.Correo);
+        var result = await _authService.ForgotPasswordAsync(request);
+        if (!result.Success)
+        {
+            _logger.LogWarning("Forgot password failed for email: {Correo} - email not found", request.Correo);
+            return BadRequest(new { message = "Correo no encontrado" });
+        }
+        _logger.LogInformation("Password recovery email sent for email: {Correo}", request.Correo);
+        return Ok(new { message = "Se envió un link de recuperación a tu correo", requestId = result.RequestId, token = result.Token });
+    }
+
+    // POST /api/Auth/reset-password/abrir [WEB]
+    // Marca como abierto el link de recuperación desde el dispositivo que lo recibe
+    // (el dispositivo que solicitó el reset hace polling a /estado)
+
+    [HttpPost("reset-password/abrir")]
+    [AllowAnonymous]
+    public async Task<IActionResult> MarcarResetAbierto([FromBody] MarcarResetAbiertoRequest request)
+    {
+        var result = await _authService.MarcarResetAbiertoAsync(request.RequestId);
+        if (!result)
+        {
+            return BadRequest(new { message = "Solicitud de recuperación no encontrada" });
+        }
+        return Ok(new { message = "Link abierto" });
+    }
+
+    // GET /api/Auth/reset-password/estado?requestId=... [WEB]
+    // El dispositivo que solicitó el reset consulta si el link ya fue abierto
+
+    [HttpGet("reset-password/estado")]
+    [AllowAnonymous]
+    public async Task<IActionResult> ResetAbierto([FromQuery] string requestId)
+    {
+        var abierto = await _authService.ResetAbiertoAsync(requestId);
+        return Ok(new { abierto });
+    }
+
+    // POST /api/Auth/reset-password [WEB]
+
+    [HttpPost("reset-password")]
+    public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordRequest request)
+    {
+        _logger.LogInformation("Password reset attempt");
+        var result = await _authService.ResetPasswordAsync(request);
+        if (!result)
+        {
+            _logger.LogWarning("Password reset failed - invalid or expired token");
+            return BadRequest(new { message = "Token inválido o expirado" });
+        }
+        _logger.LogInformation("Password reset successful");
+        return Ok(new { message = "Contraseña actualizada correctamente" });
+    }
+
+    // ── Cambio de contraseña (logueado) ───────────────────────
+    // PUT /api/Auth/cambiar-password [WEB]
+
+    [HttpPut("cambiar-password")]
+    [Authorize]
+    public async Task<IActionResult> CambiarPassword([FromBody] CambiarPasswordRequest request)
+    {
+        var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (userId == null) return Unauthorized();
+
+        _logger.LogInformation("Password change attempt for user: {UserId}", userId);
+        var result = await _authService.CambiarPasswordAsync(userId, request);
+        if (!result)
+        {
+            _logger.LogWarning("Password change failed for user: {UserId} - incorrect current password", userId);
+            return BadRequest(new { message = "Password actual incorrecto" });
+        }
+        _logger.LogInformation("Password changed successfully for user: {UserId}", userId);
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        await _auditoriaService.RegistrarAsync(userId, "cambiar_password", "usuarios_web", userId, ip);
+        return Ok(new { message = "Contraseña actualizada correctamente" });
+    }
+
+    // ── Logout ───────────────────────────────────────────────
+    // POST /api/Auth/logout [WEB]
+
+    [HttpPost("logout")]
+    [Authorize]
+    public async Task<IActionResult> Logout()
+    {
+        var jti = User.FindFirst("jti")?.Value ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        var expClaim = User.FindFirst("exp")?.Value;
+
+        if (jti == null) return BadRequest(new { message = "Token inválido" });
+
+        var expiresAt = expClaim != null
+            ? DateTimeOffset.FromUnixTimeSeconds(long.Parse(expClaim)).UtcDateTime
+            : DateTime.UtcNow.AddMinutes(30);
+
+        await _authService.RevokeTokenAsync(jti, expiresAt);
+        _logger.LogInformation("User logged out, token revoked: {Jti}", jti);
+        var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "unknown";
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        await _auditoriaService.RegistrarAsync(userId, "logout", "usuarios_web", userId, ip);
+        return Ok(new { message = "Sesión cerrada correctamente" });
+    }
+
+    // ── Logout Total (TODOS los dispositivos) ──────────────
+    // POST /api/Auth/logout-all [WEB]
+
+    [HttpPost("logout-all")]
+    [Authorize]
+    public async Task<IActionResult> LogoutAll()
+    {
+        var usuarioId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(usuarioId)) return Unauthorized();
+
+        _logger.LogInformation("Revoking all sessions for user: {UsuarioId}", usuarioId);
+        await _authService.RevocarTodasLasSesionesAsync(usuarioId);
+
+        var jti = User.FindFirst("jti")?.Value;
+        if (jti != null)
+        {
+            var expClaim = User.FindFirst("exp")?.Value;
+            var expiresAt = expClaim != null
+                ? DateTimeOffset.FromUnixTimeSeconds(long.Parse(expClaim)).UtcDateTime
+                : DateTime.UtcNow.AddMinutes(30);
+            await _authService.RevokeTokenAsync(jti, expiresAt);
+        }
+
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        await _auditoriaService.RegistrarAsync(usuarioId, "logout_total", "usuarios_web", usuarioId, ip);
+        _logger.LogInformation("All sessions terminated for user: {UsuarioId}", usuarioId);
+        return Ok(new { message = "Sesión cerrada en todos los dispositivos" });
+    }
+}
