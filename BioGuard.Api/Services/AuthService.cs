@@ -261,7 +261,14 @@ public class AuthService
             var token = GenerateToken(paciente.Id, paciente.CodigoAccesoQr, "paciente", pacienteId: paciente.Id);
             var refreshToken = await CreateAndStoreRefreshTokenAsync(paciente.Id, "paciente");
             _logger.LogInformation("Patient login by code: {PacienteId}", paciente.Id);
-            return new AuthResponse(token, paciente.Id, paciente.Nombre, "paciente", "paciente", RefreshToken: refreshToken);
+            return new AuthResponse(
+                token,
+                paciente.Id,
+                paciente.Nombre,
+                "paciente",
+                "paciente",
+                RefreshToken: refreshToken,
+                PacienteId: paciente.Id);
         }
 
         var cuidador = await _db.FindFirstOrDefaultAsync(_db.Cuidadores, c => c.CodigoAccesoQr == request.CodigoAcceso);
@@ -272,10 +279,21 @@ public class AuthService
                 _logger.LogWarning("Caregiver login by code failed - code expired: {CuidadorId}", cuidador.Id);
                 return null;
             }
-            var token = GenerateToken(cuidador.Id, cuidador.CodigoAccesoQr, "cuidador");
+            var token = GenerateToken(
+                cuidador.Id,
+                cuidador.CodigoAccesoQr,
+                "cuidador",
+                pacienteId: cuidador.PacienteId);
             var refreshToken = await CreateAndStoreRefreshTokenAsync(cuidador.Id, "cuidador");
             _logger.LogInformation("Caregiver login by code: {CuidadorId}", cuidador.Id);
-            return new AuthResponse(token, cuidador.Id, cuidador.Nombre, "cuidador", "cuidador", RefreshToken: refreshToken);
+            return new AuthResponse(
+                token,
+                cuidador.Id,
+                cuidador.Nombre,
+                "cuidador",
+                "cuidador",
+                RefreshToken: refreshToken,
+                PacienteId: cuidador.PacienteId);
         }
 
         _logger.LogWarning("Login by code failed: code not found");
@@ -298,6 +316,7 @@ public class AuthService
         string userId;
         string userEmail;
         string userName;
+        string? pacienteId = null;
 
         if (role == "paciente")
         {
@@ -310,6 +329,7 @@ public class AuthService
             userId = paciente.Id;
             userEmail = paciente.CodigoAccesoQr;
             userName = paciente.Nombre;
+            pacienteId = paciente.Id;
         }
         else if (role == "cuidador")
         {
@@ -322,6 +342,7 @@ public class AuthService
             userId = cuidador.Id;
             userEmail = cuidador.CodigoAccesoQr;
             userName = cuidador.Nombre;
+            pacienteId = cuidador.PacienteId;
         }
         else
         {
@@ -351,7 +372,6 @@ public class AuthService
 
         await RevokeRefreshTokenAsync(oldRefreshCopy);
 
-        var pacienteId = role == "paciente" ? userId : null;
         await _db.RefreshTokens.InsertOneAsync(new RefreshToken
         {
             UsuarioId = userId,

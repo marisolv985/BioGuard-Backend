@@ -22,7 +22,16 @@ public record LoginGoogleRequest(
 public record LoginCodigoRequest(
     [Required] [StringLength(50)] string CodigoAcceso);
 
-public record AuthResponse(string Token, string UserId, string Nombre, string Rol, string Plan, bool Requires2FA = false, bool RequiresVerification = false, string? RefreshToken = null);
+public record AuthResponse(
+    string Token,
+    string UserId,
+    string Nombre,
+    string Rol,
+    string Plan,
+    bool Requires2FA = false,
+    bool RequiresVerification = false,
+    string? RefreshToken = null,
+    string? PacienteId = null);
 
 public record RegisterResult(AuthResponse? Response, string? Error);
 
