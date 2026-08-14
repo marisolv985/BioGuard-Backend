@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using SendGrid;
 using SendGrid.Helpers.Mail;
+using System.Net.Http.Json;
 
 namespace BioGuard.Api.Services;
 
@@ -12,6 +13,7 @@ public class EmailService : IEmailService
 {
     private readonly IConfiguration _config;
     private readonly ILogger<EmailService> _logger;
+    private static readonly HttpClient AppsScriptHttpClient = new();
 
     public EmailService(IConfiguration config, ILogger<EmailService> logger)
     {
@@ -62,6 +64,30 @@ public class EmailService : IEmailService
     {
         try
         {
+            var appsScriptUrl = FallbackIfEmpty(
+                _config["AppsScriptMail:Url"],
+                Environment.GetEnvironmentVariable("APPS_SCRIPT_MAIL_URL")
+            );
+
+            var appsScriptSecret = FallbackIfEmpty(
+                _config["AppsScriptMail:Secret"],
+                Environment.GetEnvironmentVariable("APPS_SCRIPT_MAIL_SECRET")
+            );
+
+            if (
+                !string.IsNullOrWhiteSpace(appsScriptUrl) &&
+                !string.IsNullOrWhiteSpace(appsScriptSecret)
+            )
+            {
+                return await SendViaAppsScriptAsync(
+                    appsScriptUrl,
+                    appsScriptSecret,
+                    toEmail,
+                    subject,
+                    htmlBody
+                );
+            }
+
             var apiKey = FallbackIfEmpty(_config["SendGrid:ApiKey"], Environment.GetEnvironmentVariable("SENDGRID_API_KEY"));
             if (!string.IsNullOrWhiteSpace(apiKey))
             {
@@ -72,6 +98,73 @@ public class EmailService : IEmailService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to send email");
+            return false;
+        }
+    }
+
+    private async Task<bool> SendViaAppsScriptAsync(
+        string url,
+        string secret,
+        string toEmail,
+        string subject,
+        string htmlBody)
+    {
+        try
+        {
+            using var response = await AppsScriptHttpClient.PostAsJsonAsync(
+                url,
+                new
+                {
+                    secret,
+                    to = toEmail,
+                    subject,
+                    htmlBody,
+                    body = subject
+                }
+            );
+
+            var responseBody = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "Apps Script mail rejected request. Status: {StatusCode} Body: {Body}",
+                    response.StatusCode,
+                    responseBody
+                );
+                return false;
+            }
+
+            using var document =
+                System.Text.Json.JsonDocument.Parse(responseBody);
+
+            var root = document.RootElement;
+
+            if (
+                !root.TryGetProperty("ok", out var okElement) ||
+                !okElement.GetBoolean()
+            )
+            {
+                _logger.LogWarning(
+                    "Apps Script mail returned failure. Body: {Body}",
+                    responseBody
+                );
+                return false;
+            }
+
+            _logger.LogInformation(
+                "Email sent via Google Apps Script. Subject: {Subject}",
+                subject
+            );
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Google Apps Script email delivery failed"
+            );
             return false;
         }
     }
